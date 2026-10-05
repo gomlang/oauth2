@@ -1,0 +1,199 @@
+package oauth2;
+
+use std::json;
+use std::net::url;
+use std::num;
+
+fn response_string(value: json::Value, name: string, required: bool) -> Result[
+    Option[string],
+    Error,
+] {
+    match json::field(value, name) {
+        Option::None => if required {
+            Err(protocol("required token response field missing"))
+        } else {
+            Ok(Option::None)
+        },
+        Option::Some(json::Value::String(text)) => Ok(Option::Some(text)),
+        _ => Err(protocol("token response field has incorrect type")),
+    }
+}
+
+fn oauth_text(value: string, spaces: bool) -> bool {
+    for byte in value.to_bytes() {
+        if byte
+            < (if spaces {
+                32
+            } else {
+                33
+            })
+            || byte > 126
+            || byte == 34
+            || byte == 92 {
+            return false
+        }
+    }
+    true
+}
+
+fn encoded_uri(value: string, absolute: bool) -> bool {
+    for byte in value.to_bytes() {
+        if byte < 33 || byte > 126 {
+            return false
+        }
+    }
+    let reference = match url::Reference::parse(value, 16384) {
+        Ok(reference) => reference,
+        Err(_) => return false,
+    };
+    if absolute && !reference.is_absolute() {
+        return false
+    }
+    match reference.to_ascii(16384) {
+        Ok(ascii) => ascii.byte_len() == value.byte_len(),
+        Err(_) => false,
+    }
+}
+
+fn token_type(value: string) -> bool {
+    if !bounded_text(value, false) {
+        return false
+    }
+    let mut name = true;
+    for byte in value.to_bytes() {
+        if !((byte >= b'A' && byte <= b'Z') || (byte >= b'a' && byte <= b'z')
+            || (byte >= b'0' && byte <= b'9')
+            || byte == b'-'
+            || byte == b'.'
+            || byte == b'_') {
+            name = false;
+        }
+    }
+    if name {
+        return true
+    }
+    encoded_uri(value, true)
+}
+
+fn remote_error(
+    code: string,
+    description: Option[string],
+    uri: Option[string],
+    status: Option[isize],
+) -> Result[Error, Error] {
+    if code == "" || !oauth_text(code, true) {
+        return Err(protocol("invalid OAuth error code"))
+    }
+    if let Option::Some(text) = description {
+        if !oauth_text(text, true) {
+            return Err(protocol("invalid OAuth error description"))
+        }
+    }
+    if let Option::Some(text) = uri {
+        if !oauth_text(text, false) || !encoded_uri(text, false) {
+            return Err(protocol("invalid OAuth error URI"))
+        }
+    }
+    Ok(
+        Error {
+            kind: ErrorKind::Remote,
+            status,
+            message: "authorization server returned an OAuth error",
+            remote_code: Option::Some(Secret::new(code)),
+            remote_description: description.map(|text| Secret::new(text)),
+            remote_uri: uri.map(|text| Secret::new(text)),
+        },
+    )
+}
+
+fn parse_response(text: string, status: isize, maximum: isize) -> Result[Token, Error] {
+    parse_token(text, status, maximum).map_err(
+        |failure| Error { status: Option::Some(status), ..failure },
+    )
+}
+
+fn parse_token(text: string, status: isize, maximum: isize) -> Result[Token, Error] {
+    let value = json::parse_with_limits(
+        text,
+        json::DecodeLimits {
+            max_input_bytes: maximum,
+            max_value_bytes: maximum,
+            max_depth: 16,
+            max_values: 1024,
+            max_string_bytes: maximum,
+            max_number_bytes: 32,
+            max_container_entries: 128,
+            max_path_bytes: 4096,
+            max_serde_frames: 64,
+            max_events: 4096,
+        },
+    ).map_err(|_| protocol("invalid or excessive token JSON"))?;
+    let json::Value::Object(fields) = value else {
+        return Err(protocol("token response must be an object"))
+    };
+    let seen: HashMap[string, bool] = HashMap::new();
+    for (name, _) in fields {
+        if seen.contains(name) {
+            return Err(protocol("duplicate token response parameter"))
+        }
+        seen.insert(name, true);
+    }
+    if status != 200 {
+        let code = response_string(value, "error", true)?.unwrap_or("");
+        return Err(
+            remote_error(
+                code,
+                response_string(value, "error_description", false)?,
+                response_string(value, "error_uri", false)?,
+                Option::Some(status),
+            )?,
+        )
+    }
+    if json::field(value, "error").is_some() {
+        return Err(protocol("successful HTTP response contains OAuth error"))
+    }
+    let access = response_string(value, "access_token", true)?.unwrap_or("");
+    let kind = response_string(value, "token_type", true)?.unwrap_or("");
+    if !bounded_text(access, false) || !token_type(kind) {
+        return Err(protocol("empty or invalid token response"))
+    }
+    let refresh = response_string(value, "refresh_token", false)?;
+    if let Option::Some(text) = refresh {
+        if !bounded_text(text, false) {
+            return Err(protocol("empty or invalid refresh token"))
+        }
+    }
+    let expires: Option[isize] = match json::field(value, "expires_in") {
+        Option::None => Option::None,
+        Option::Some(json::Value::Number(text)) => {
+            for byte in text.to_bytes() {
+                if byte < b'0' || byte > b'9' {
+                    return Err(protocol("expires_in must be a nonnegative integer"))
+                }
+            }
+            Option::Some(
+                num::parse_int_structured(text).map_err(
+                    |_| protocol("expires_in exceeds integer range"),
+                )?,
+            )
+        },
+        _ => return Err(protocol("expires_in must be a nonnegative integer")),
+    };
+    let scope: Option[Vec[string]] = match response_string(value, "scope", false)? {
+        Option::None => Option::None,
+        Option::Some(text) => {
+            let scopes = text.split(" ");
+            let _ = scope_text(scopes).map_err(|_| protocol("invalid token scope"))?;
+            Option::Some(scopes)
+        },
+    };
+    Ok(
+        Token {
+            access: Secret::new(access),
+            refresh: refresh.map(|text| Secret::new(text)),
+            kind,
+            expires,
+            scope,
+        },
+    )
+}

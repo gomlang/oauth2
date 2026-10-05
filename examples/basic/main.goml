@@ -1,0 +1,28 @@
+package main;
+
+use ecosystem::oauth2;
+
+fn prepare() -> Result[(), oauth2::Error] {
+    let client = oauth2::Client::new(
+        "example-client",
+        "https://server.example/token",
+        oauth2::ClientAuth::Public,
+        oauth2::Options::new(),
+    )?;
+    defer client.close();
+    let authorization = client.authorization(
+        "https://server.example/authorize",
+        "https://client.example/callback",
+        Vec::from_array(["profile"]),
+    )?;
+    println("OAuth2 authorization code with PKCE S256 ready");
+    println(authorization.pkce().debug());
+    Ok(())
+}
+
+fn main() -> () {
+    match prepare() {
+        Ok(_) => (),
+        Err(problem) => println(problem.to_string()),
+    }
+}

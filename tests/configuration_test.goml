@@ -1,0 +1,255 @@
+package tests;
+
+use ecosystem::oauth2;
+use std::testing;
+use std::context;
+use std::time::{Duration};
+
+#[test]
+fn endpoints_reserved_queries_limits_and_scope_validation_precede_io() -> () {
+    for endpoint in[
+        "http://127.0.0.1/token",
+        "https://server.example/token#",
+        "https://server.example/token#secret",
+        "https://user:pass@server.example/token",
+        "https://server.example/token?grant%5Ftype=x",
+        "https://server.example/token?a=1&a=2",
+        "https://server.example/token?%FF=x",
+        "https://server.example/token?bad=%GG",
+    ] {
+        testing::assert_err(
+            oauth2::Client::new(
+                "client",
+                endpoint,
+                oauth2::ClientAuth::Public,
+                oauth2::Options::new(),
+            ),
+        );
+    }
+    let local = oauth2::Options {
+        transport: oauth2::TransportPolicy::LoopbackHttp,
+        ..oauth2::Options::new(),
+    };
+    for endpoint in[
+        "http://localhost/token",
+        "http://127.0.0.2/token",
+        "http://127.0.0.1.attacker.example/token",
+        "http://[::2]/token",
+        "ftp://127.0.0.1/token",
+    ] {
+        testing::assert_err(
+            oauth2::Client::new("client", endpoint, oauth2::ClientAuth::Public, local),
+        );
+    }
+    for endpoint in[
+        "http://127.0.0.1/token",
+        "http://[::1]:1234/token",
+        "https://server.example/token?tenant=a%2Bb",
+    ] {
+        let client = testing::expect_ok(
+            oauth2::Client::new("client", endpoint, oauth2::ClientAuth::Public, local),
+            "allowed endpoint",
+        );
+        client.close();
+    }
+    for issuer in[
+        "http://server.example",
+        "https://server.example?",
+        "https://server.example?x=1",
+        "https://server.example#",
+    ] {
+        testing::assert_err(
+            oauth2::Client::new(
+                "client",
+                "https://server.example/token",
+                oauth2::ClientAuth::Public,
+                oauth2::Options { expected_issuer: Option::Some(issuer), ..oauth2::Options::new() },
+            ),
+        );
+    }
+    for limit in[0, -1, 16777217] {
+        testing::assert_err(
+            oauth2::Client::new(
+                "client",
+                "https://server.example/token",
+                oauth2::ClientAuth::Public,
+                oauth2::Options { request_bytes: limit, ..oauth2::Options::new() },
+            ),
+        );
+        testing::assert_err(
+            oauth2::Client::new(
+                "client",
+                "https://server.example/token",
+                oauth2::ClientAuth::Public,
+                oauth2::Options { response_bytes: limit, ..oauth2::Options::new() },
+            ),
+        );
+    }
+    testing::assert_err(
+        oauth2::Client::new(
+            "client",
+            "https://server.example/token",
+            oauth2::ClientAuth::Public,
+            oauth2::Options { timeout: Duration::zero(), ..oauth2::Options::new() },
+        ),
+    );
+    let client = testing::expect_ok(
+        oauth2::Client::new(
+            "client",
+            "https://server.example/token",
+            oauth2::ClientAuth::Public,
+            oauth2::Options::new(),
+        ),
+        "client",
+    );
+    defer client.close();
+    for endpoint in[
+        "https://server.example/authorize#",
+        "https://server.example/authorize?state=x",
+        "https://server.example/authorize?code_challenge=x",
+        "http://127.0.0.1/authorize",
+    ] {
+        testing::assert_err(client.authorization(endpoint, "https://app.example/cb", Vec::new()));
+    }
+    for redirect in[
+        "https://app.example/cb#",
+        "https://app.example/cb?code=x",
+        "https://app.example/cb?iss=x",
+        "app:/callback",
+        "http://127.0.0.1/cb",
+    ] {
+        testing::assert_err(
+            client.authorization("https://server.example/authorize", redirect, Vec::new()),
+        );
+    }
+    for scopes in Vec::from_array(
+        [
+            Vec::from_array([""]),
+            Vec::from_array(["read", "read"]),
+            Vec::from_array(["two words"]),
+            Vec::from_array(["é"]),
+            Vec::from_array(["quote\""]),
+            Vec::from_array(["back\\slash"]),
+        ],
+    ) {
+        testing::assert_err(
+            client.authorization(
+                "https://server.example/authorize",
+                "https://app.example/cb",
+                scopes,
+            ),
+        );
+    }
+}
+
+#[test]
+fn issuer_check_and_consumption_on_transport_error() -> () {
+    let server = start(false);
+    defer close(server);
+    let client = testing::expect_ok(
+        oauth2::Client::new(
+            "client :+é",
+            url(server) + "/token",
+            basic(),
+            oauth2::Options {
+                expected_issuer: Option::Some("https://server.example/issuer"),
+                ..options(server, false),
+            },
+        ),
+        "client",
+    );
+    defer client.close();
+    let flow = testing::expect_ok(
+        client.authorization(
+            "https://server.example/authorize",
+            "https://client.example/callback?fixed=yes",
+            Vec::new(),
+        ),
+        "flow",
+    );
+    challenge(server, flow.pkce().challenge());
+    for suffix in[
+        "",
+        "&iss=https%3A%2F%2Fevil.example",
+        "&iss=https%3A%2F%2Fserver.example%2Fissuer%2F",
+    ] {
+        testing::assert_eq(
+            testing::expect_err(
+                flow.exchange(context::Context::background(), callback(flow) + suffix),
+                "issuer mismatch",
+            ).kind,
+            oauth2::ErrorKind::State,
+        );
+    }
+    testing::assert_eq(count(server), 0);
+    assert_token(
+        testing::expect_ok(
+            flow.exchange(
+                context::Context::background(),
+                callback(flow) + "&iss=https%3A%2F%2Fserver.example%2Fissuer",
+            ),
+            "issuer match",
+        ),
+    );
+    let denied = testing::expect_ok(
+        client.authorization(
+            "https://server.example/authorize",
+            "https://client.example/callback",
+            Vec::new(),
+        ),
+        "denied flow",
+    );
+    let response = "https://client.example/callback?state=" + denied.state().expose()
+        + "&error=access_denied";
+    testing::assert_eq(
+        testing::expect_err(
+            denied.exchange(context::Context::background(), response),
+            "error needs issuer",
+        ).kind,
+        oauth2::ErrorKind::State,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            denied.exchange(
+                context::Context::background(),
+                response + "&iss=https%3A%2F%2Fserver.example%2Fissuer",
+            ),
+            "denied",
+        ).kind,
+        oauth2::ErrorKind::Remote,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            denied.exchange(context::Context::background(), response),
+            "denial consumed",
+        ).kind,
+        oauth2::ErrorKind::Consumed,
+    );
+    let failed = testing::expect_ok(
+        client.authorization(
+            "https://server.example/authorize",
+            "https://client.example/callback?fixed=yes",
+            Vec::new(),
+        ),
+        "failed flow",
+    );
+    client.close();
+    testing::assert_eq(
+        testing::expect_err(
+            failed.exchange(
+                context::Context::background(),
+                callback(failed) + "&iss=https%3A%2F%2Fserver.example%2Fissuer",
+            ),
+            "closed",
+        ).kind,
+        oauth2::ErrorKind::Closed,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            failed.exchange(context::Context::background(), callback(failed)),
+            "failed exchange consumed",
+        ).kind,
+        oauth2::ErrorKind::Consumed,
+    );
+    testing::assert_eq(count(server), 1);
+}

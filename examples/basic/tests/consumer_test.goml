@@ -1,0 +1,51 @@
+package tests;
+
+use ecosystem::oauth2;
+use std::testing;
+
+#[test]
+fn public_dependency_pkce_and_authorization_are_offline() -> () {
+    let proof = testing::expect_ok(
+        oauth2::Pkce::from_verifier(
+            oauth2::Secret::new("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+        ),
+        "PKCE",
+    );
+    testing::assert_eq(proof.challenge(), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    let client = testing::expect_ok(
+        oauth2::Client::new(
+            "downstream",
+            "https://server.example/token",
+            oauth2::ClientAuth::Public,
+            oauth2::Options::new(),
+        ),
+        "client",
+    );
+    defer client.close();
+    let scopes = Vec::from_array(["read"]);
+    let flow = testing::expect_ok(
+        client.authorization(
+            "https://server.example/authorize",
+            "https://app.example/callback",
+            scopes,
+        ),
+        "flow",
+    );
+    scopes.clear();
+    testing::assert(flow.url().contains("scope=read"));
+    testing::assert(flow.url().contains("code_challenge_method=S256"));
+    testing::assert_eq(flow.state().expose().byte_len(), 43);
+    testing::assert_eq(flow.debug(), "Authorization([REDACTED])");
+}
+
+#[test]
+fn default_transport_rejects_cleartext_without_connecting() -> () {
+    testing::assert_err(
+        oauth2::Client::new(
+            "downstream",
+            "http://127.0.0.1/token",
+            oauth2::ClientAuth::Public,
+            oauth2::Options::new(),
+        ),
+    );
+}

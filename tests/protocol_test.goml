@@ -1,0 +1,439 @@
+package tests;
+
+use ecosystem::oauth2;
+use std::testing;
+use std::context;
+use std::task;
+use std::time::{Duration};
+
+fn options(server: Server, secure: bool) -> oauth2::Options {
+    oauth2::Options {
+        transport: if secure {
+            oauth2::TransportPolicy::HttpsOnly
+        } else {
+            oauth2::TransportPolicy::LoopbackHttp
+        },
+        root_certificate: if secure {
+            certificate(server)
+        } else {
+            ""
+        },
+        ..oauth2::Options::new(),
+    }
+}
+
+fn client(server: Server, secure: bool, path: string, auth: oauth2::ClientAuth) -> oauth2::Client {
+    testing::expect_ok(
+        oauth2::Client::new("client :+é", url(server) + path, auth, options(server, secure)),
+        "client",
+    )
+}
+
+fn basic() -> oauth2::ClientAuth {
+    oauth2::ClientAuth::Basic(oauth2::Secret::new("secret :+é"))
+}
+
+fn callback(flow: oauth2::Authorization) -> string {
+    "https://client.example/callback?fixed=yes&code=code+%3A%2B%C3%A9&state="
+        + flow.state().expose()
+}
+
+fn assert_token(token: oauth2::Token) -> () {
+    testing::assert_eq(token.access_token().expose(), "access:test+value");
+    testing::assert_eq(
+        testing::expect_some(token.refresh_token(), "refresh token").expose(),
+        "refresh&value",
+    );
+    testing::assert_eq(token.token_type(), "Bearer");
+    testing::assert(token.expires_in() == Option::Some(0));
+    let scopes = testing::expect_some(token.scopes(), "scopes");
+    scopes.clear();
+    testing::assert(
+        testing::expect_some(token.scopes(), "scopes") == Vec::from_array(["read", "write"]),
+    );
+    testing::assert(!token.debug().contains("access:"));
+}
+
+#[test]
+fn pkce_rfc7636_vector_generation_validation_and_redaction() -> () {
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let proof = testing::expect_ok(
+        oauth2::Pkce::from_verifier(oauth2::Secret::new(verifier)),
+        "RFC verifier",
+    );
+    testing::assert_eq(proof.challenge(), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    testing::assert(proof.matches(proof.challenge()));
+    testing::assert(!proof.matches("invalid"));
+    testing::assert(!proof.debug().contains(verifier));
+    testing::assert(!proof.verifier().debug().contains(verifier));
+    testing::assert(!proof.verifier().to_string().contains(verifier));
+    for value in["x".repeat(42), "x".repeat(129), "x".repeat(42) + "+", "é".repeat(43)] {
+        testing::assert_err(oauth2::Pkce::from_verifier(oauth2::Secret::new(value)));
+    }
+    testing::assert_ok(oauth2::Pkce::from_verifier(oauth2::Secret::new("~".repeat(128))));
+    let first = testing::expect_ok(oauth2::Pkce::generate(), "random");
+    let second = testing::expect_ok(oauth2::Pkce::generate(), "random");
+    testing::assert_eq(first.verifier().expose().byte_len(), 43);
+    testing::assert(first.verifier().expose() != second.verifier().expose());
+}
+
+#[test]
+fn real_http_tls_authorization_pkce_refresh_and_explicit_authentication() -> () {
+    for secure in[false, true] {
+        let server = start(secure);
+        defer close(server);
+        for (path, auth) in Vec::from_array(
+            [
+                ("/token?tenant=one", basic()),
+                ("/post", oauth2::ClientAuth::Post(oauth2::Secret::new("secret :+é"))),
+                ("/public", oauth2::ClientAuth::Public),
+            ],
+        ) {
+            let client = client(server, secure, path, auth);
+            defer client.close();
+            let flow = testing::expect_ok(
+                client.authorization(
+                    "https://server.example/authorize?kept=a%2Bb",
+                    "https://client.example/callback?fixed=yes",
+                    Vec::from_array(["read", "write"]),
+                ),
+                "authorization",
+            );
+            challenge(server, flow.pkce().challenge());
+            testing::assert(check_authorization(server, flow.url()));
+            testing::assert(!flow.debug().contains(flow.state().expose()));
+            assert_token(
+                testing::expect_ok(
+                    flow.exchange(context::Context::background(), callback(flow)),
+                    "code exchange",
+                ),
+            );
+            if path == "/token?tenant=one" {
+                testing::assert(last(server).contains("tenant=one"));
+            }
+            testing::assert_eq(
+                testing::expect_err(
+                    flow.exchange(context::Context::background(), callback(flow)),
+                    "one use",
+                ).kind,
+                oauth2::ErrorKind::Consumed,
+            );
+            assert_token(
+                testing::expect_ok(
+                    client.refresh(
+                        context::Context::background(),
+                        oauth2::Secret::new("refresh&value"),
+                        Vec::from_array(["read"]),
+                    ),
+                    "refresh",
+                ),
+            );
+            if path != "/public" {
+                assert_token(
+                    testing::expect_ok(
+                        client.client_credentials(
+                            context::Context::background(),
+                            Vec::from_array(["read", "write"]),
+                        ),
+                        "credentials",
+                    ),
+                );
+            } else {
+                let before = count(server);
+                testing::assert_err(
+                    client.client_credentials(context::Context::background(), Vec::new()),
+                );
+                testing::assert_eq(count(server), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn callback_state_redirect_duplicates_issuer_errors_and_shared_consumption() -> () {
+    let server = start(false);
+    defer close(server);
+    let client = client(server, false, "/token", basic());
+    defer client.close();
+    let flow = testing::expect_ok(
+        client.authorization(
+            "https://server.example/authorize",
+            "https://client.example/callback?fixed=yes",
+            Vec::new(),
+        ),
+        "flow",
+    );
+    challenge(server, flow.pkce().challenge());
+    for suffix in[
+        "&state=other",
+        "&state=" + flow.state().expose() + "&state=" + flow.state().expose(),
+        "&state=" + flow.state().expose() + "&code=extra",
+    ] {
+        testing::assert_err(
+            flow.exchange(
+                context::Context::background(),
+                "https://client.example/callback?fixed=yes&code=code" + suffix,
+            ),
+        );
+    }
+    testing::assert_err(
+        flow.exchange(
+            context::Context::background(),
+            "https://attacker.example/callback?fixed=yes&code=x&state=" + flow.state().expose(),
+        ),
+    );
+    testing::assert_err(
+        flow.exchange(
+            context::Context::background(),
+            "https://client.example/callback?fixed=no&code=x&state=" + flow.state().expose(),
+        ),
+    );
+    testing::assert_eq(count(server), 0);
+    let alias = flow;
+    task::scope(
+        |scope| {
+            let first = scope.spawn(
+                |_| flow.exchange(context::Context::background(), callback(flow)),
+            );
+            let second = scope.spawn(
+                |_| alias.exchange(context::Context::background(), callback(alias)),
+            );
+            let a = first.join();
+            let b = second.join();
+            testing::assert(a.is_ok() != b.is_ok());
+            let failure = if a.is_err() {
+                testing::expect_err(a, "first consumed")
+            } else {
+                testing::expect_err(b, "second consumed")
+            };
+            testing::assert_eq(failure.kind, oauth2::ErrorKind::Consumed);
+        },
+    );
+    testing::assert_eq(count(server), 1);
+    let denied = testing::expect_ok(
+        client.authorization(
+            "https://server.example/authorize",
+            "https://client.example/callback",
+            Vec::new(),
+        ),
+        "flow",
+    );
+    let problem = testing::expect_err(
+        denied.exchange(
+            context::Context::background(),
+            "https://client.example/callback?error=access_denied&error_description=secret-canary&state="
+                + denied.state().expose(),
+        ),
+        "denied",
+    );
+    testing::assert_eq(problem.kind, oauth2::ErrorKind::Remote);
+    testing::assert_eq(
+        testing::expect_some(problem.remote_code, "remote code").expose(),
+        "access_denied",
+    );
+    testing::assert(!problem.debug().contains("secret-canary"));
+    testing::assert_eq(count(server), 1);
+}
+
+#[test]
+fn token_errors_are_bounded_typed_and_redacted_and_redirects_never_follow() -> () {
+    let server = start(false);
+    defer close(server);
+    for path in[
+        "/bad-type",
+        "/duplicate-extension",
+        "/wrong-scope",
+        "/empty-token",
+        "/string-expires",
+        "/duplicate-content",
+        "/duplicate",
+        "/invalid-expires",
+        "/overflow-expires",
+        "/negative-expires",
+        "/missing",
+        "/null",
+        "/success-error",
+        "/nonjson",
+        "/invalid-json",
+        "/binary",
+    ] {
+        let client = client(server, false, path, basic());
+        defer client.close();
+        let problem = testing::expect_err(
+            client.client_credentials(context::Context::background(), Vec::new()),
+            "protocol",
+        );
+        testing::assert_eq(problem.kind, oauth2::ErrorKind::Protocol);
+        testing::assert(!problem.to_string().contains("secret-canary"));
+        testing::assert(problem.status == Option::Some(200));
+    }
+    let remote = client(server, false, "/error", basic());
+    defer remote.close();
+    let problem = testing::expect_err(
+        remote.client_credentials(context::Context::background(), Vec::new()),
+        "remote",
+    );
+    testing::assert_eq(problem.kind, oauth2::ErrorKind::Remote);
+    testing::assert(problem.status == Option::Some(400));
+    testing::assert_eq(
+        testing::expect_some(problem.remote_code, "remote code").expose(),
+        "invalid_grant",
+    );
+    testing::assert(!problem.debug().contains("token-secret"));
+    let redirect = client(server, false, "/redirect", basic());
+    defer redirect.close();
+    let before = count(server);
+    testing::assert_eq(
+        testing::expect_err(
+            redirect.client_credentials(context::Context::background(), Vec::new()),
+            "redirect",
+        ).kind,
+        oauth2::ErrorKind::Http,
+    );
+    testing::assert_eq(count(server), before + 1);
+    let limited = testing::expect_ok(
+        oauth2::Client::new(
+            "client :+é",
+            url(server) + "/large",
+            basic(),
+            oauth2::Options { response_bytes: 64, ..options(server, false) },
+        ),
+        "limited",
+    );
+    defer limited.close();
+    testing::assert_eq(
+        testing::expect_err(
+            limited.client_credentials(context::Context::background(), Vec::new()),
+            "body limit",
+        ).kind,
+        oauth2::ErrorKind::BodyLimit,
+    );
+}
+
+#[test]
+fn tls_trust_context_cancellation_deadline_close_and_request_limit() -> () {
+    let tls = start(true);
+    defer close(tls);
+    let untrusted = testing::expect_ok(
+        oauth2::Client::new("client :+é", url(tls) + "/token", basic(), oauth2::Options::new()),
+        "untrusted",
+    );
+    defer untrusted.close();
+    testing::assert_eq(
+        testing::expect_err(
+            untrusted.client_credentials(context::Context::background(), Vec::new()),
+            "untrusted CA",
+        ).kind,
+        oauth2::ErrorKind::Transport,
+    );
+    let server = start(false);
+    defer close(server);
+    let client = client(server, false, "/wait", basic());
+    defer client.close();
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            task::scope(
+                |scope| {
+                    let work = scope.spawn(|_| client.client_credentials(ctx, Vec::new()));
+                    testing::assert(wait_request(server));
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(work.join(), "cancelled").kind,
+                        oauth2::ErrorKind::Cancelled,
+                    );
+                },
+            );
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_milliseconds(40),
+        |ctx, _| {
+            testing::assert_eq(
+                testing::expect_err(client.client_credentials(ctx, Vec::new()), "deadline").kind,
+                oauth2::ErrorKind::Timeout,
+            );
+        },
+    );
+    client.close();
+    testing::assert_eq(
+        testing::expect_err(
+            client.client_credentials(context::Context::background(), Vec::new()),
+            "closed",
+        ).kind,
+        oauth2::ErrorKind::Closed,
+    );
+    let limited = testing::expect_ok(
+        oauth2::Client::new(
+            "client :+é",
+            url(server) + "/token",
+            basic(),
+            oauth2::Options { request_bytes: 1, ..options(server, false) },
+        ),
+        "request limit",
+    );
+    defer limited.close();
+    let before = count(server);
+    testing::assert_eq(
+        testing::expect_err(
+            limited.client_credentials(context::Context::background(), Vec::new()),
+            "request body",
+        ).kind,
+        oauth2::ErrorKind::BodyLimit,
+    );
+    testing::assert_eq(count(server), before);
+}
+
+#[test]
+fn optional_token_metadata_is_distinct_from_zero_and_maximum_expiry() -> () {
+    let server = start(false);
+    defer close(server);
+    for path in["/minimal", "/uri-type"] {
+        let client = client(server, false, path, basic());
+        defer client.close();
+        let token = testing::expect_ok(
+            client.client_credentials(context::Context::background(), Vec::new()),
+            "metadata",
+        );
+        testing::assert_eq(token.access_token().expose(), "minimal");
+        testing::assert(token.refresh_token().is_none());
+        testing::assert(token.scopes().is_none());
+        if path == "/minimal" {
+            testing::assert(token.expires_in().is_none());
+            testing::assert_eq(token.token_type(), "bearer");
+        } else {
+            testing::assert(token.expires_in() == Option::Some(9223372036854775807));
+            testing::assert_eq(token.token_type(), "urn:example:token");
+        }
+    }
+}
+
+#[test]
+fn response_uri_metadata_must_already_use_valid_uri_encoding() -> () {
+    let server = start(false);
+    defer close(server);
+    for path in[
+        "/spaced-uri-type",
+        "/unicode-uri-type",
+        "/invalid-error-uri",
+        "/invalid-error-uri-char",
+    ] {
+        let client = client(server, false, path, basic());
+        defer client.close();
+        testing::assert_eq(
+            testing::expect_err(
+                client.client_credentials(context::Context::background(), Vec::new()),
+                "invalid URI metadata",
+            ).kind,
+            oauth2::ErrorKind::Protocol,
+        );
+    }
+    let client = client(server, false, "/escaped-uri-type", basic());
+    defer client.close();
+    let token = testing::expect_ok(
+        client.client_credentials(context::Context::background(), Vec::new()),
+        "encoded URI type",
+    );
+    testing::assert_eq(token.token_type(), "urn:example:bad%20type?x=%c3%a9");
+}

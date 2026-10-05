@@ -1,0 +1,54 @@
+package tests;
+
+use std::ffi;
+use std::testing;
+
+#[go_type("example.com/goml-ecosystem/oauth2/testserver", "Server")]
+extern type Server;
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Start")]
+extern fn start(secure: bool) -> Server;
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Close")]
+extern fn close(server: Server) -> ();
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "URL")]
+extern fn native_url(server: Server) -> ffi::String;
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Certificate")]
+extern fn native_certificate(server: Server) -> ffi::String;
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Last")]
+extern fn native_last(server: Server) -> ffi::String;
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Challenge")]
+extern fn native_challenge(server: Server, value: ffi::String) -> ();
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Count")]
+extern fn count(server: Server) -> isize;
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "Wait")]
+extern fn wait_request(server: Server) -> bool;
+
+fn url(server: Server) -> string {
+    testing::expect_ok(ffi::string_text(native_url(server)), "URL")
+}
+
+fn certificate(server: Server) -> string {
+    testing::expect_ok(ffi::string_text(native_certificate(server)), "certificate")
+}
+
+fn last(server: Server) -> string {
+    testing::expect_ok(ffi::string_text(native_last(server)), "request")
+}
+
+fn challenge(server: Server, value: string) -> () {
+    native_challenge(server, ffi::string_from_text(value))
+}
+
+#[go_ffi("example.com/goml-ecosystem/oauth2/testserver", "CheckAuthorization")]
+extern fn native_authorization(server: Server, value: ffi::String) -> bool;
+
+fn check_authorization(server: Server, value: string) -> bool {
+    native_authorization(server, ffi::string_from_text(value))
+}

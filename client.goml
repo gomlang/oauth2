@@ -1,0 +1,166 @@
+package oauth2;
+
+use ecosystem::request;
+use std::context;
+
+pub struct Client {
+    id: string,
+    token_endpoint: string,
+    authentication: ClientAuth,
+    options: Options,
+    http: request::Client,
+}
+
+impl Debug for Client {
+    fn debug(self: Client) -> string {
+        "OAuth2Client([REDACTED])"
+    }
+}
+
+impl Client {
+    pub fn new(id: string, token_endpoint: string, authentication: ClientAuth, options: Options) -> Result[
+        Client,
+        Error,
+    ] {
+        if !bounded_text(id, false) || options.response_bytes < 1
+            || options.response_bytes > 16777216
+            || options.request_bytes < 1
+            || options.request_bytes > 16777216 {
+            return Err(config("invalid client identifier or body limit"))
+        }
+        match authentication {
+            Basic(secret) | Post(secret) => if !bounded_text(secret.expose(), true) {
+                return Err(config("invalid client secret"))
+            },
+            Public => (),
+        }
+        let reference = endpoint(token_endpoint, options.transport)?;
+        reserved_query(
+            reference,
+            Vec::from_array(
+                [
+                    "grant_type",
+                    "client_id",
+                    "client_secret",
+                    "code",
+                    "code_verifier",
+                    "redirect_uri",
+                    "refresh_token",
+                    "scope",
+                ],
+            ),
+        )?;
+        if let Option::Some(issuer) = options.expected_issuer {
+            let reference = endpoint(issuer, TransportPolicy::HttpsOnly)?;
+            if reference.raw_query().is_some() {
+                return Err(config("issuer must not contain a query"))
+            }
+        }
+        let mut builder = request::Client::builder().timeout(options.timeout).body_limit(
+            options.response_bytes,
+        ).request_body_limit(options.request_bytes).redirect(request::RedirectPolicy::None).gzip(
+            false,
+        ).no_proxy();
+        if options.root_certificate != "" {
+            builder = builder.add_root_certificate(options.root_certificate);
+        }
+        let http = builder.build().map_err(|_| config("invalid transport configuration"))?;
+        Ok(Client { id, token_endpoint, authentication, options, http })
+    }
+
+    pub fn close(self: Client) -> () {
+        self.http.close()
+    }
+
+    fn send(self: Client, context: context::Context, fields: Vec[(string, string)]) -> Result[
+        Token,
+        Error,
+    ] {
+        let mut builder = self.http.post(self.token_endpoint).header("Accept", "application/json").redirect(
+            request::RedirectPolicy::None,
+        );
+        match self.authentication {
+            Public => fields.push(("client_id", self.id)),
+            Basic(secret) => {
+                builder = builder.basic_auth(
+                    form_component(self.id)?,
+                    form_component(secret.expose())?,
+                );
+            },
+            Post(secret) => {
+                fields.push(("client_id", self.id));
+                fields.push(("client_secret", secret.expose()));
+            },
+        }
+        let response = builder.form(fields).send_with(context).map_err(transport_error)?;
+        let status = response.status().as_isize();
+        if status >= 300 && status < 400 {
+            return Err(
+                Error {
+                    status: Option::Some(status),
+                    ..error(ErrorKind::Http, "token endpoint redirect refused"),
+                },
+            )
+        }
+        let content = response.headers().get_all("content-type");
+        if content.len() != 1
+            || !content[0].split(";")[0].trim().eq_ignore_ascii_case("application/json") {
+            return Err(
+                Error {
+                    status: Option::Some(status),
+                    ..protocol("token endpoint must return application/json"),
+                },
+            )
+        }
+        let text = response.text().map_err(
+            |_| Error { status: Option::Some(status), ..protocol("token response is not UTF-8") },
+        )?;
+        parse_response(text, status, self.options.response_bytes)
+    }
+
+    pub fn refresh(
+        self: Client,
+        context: context::Context,
+        refresh_token: Secret,
+        scopes: Vec[string],
+    ) -> Result[Token, Error] {
+        if !bounded_text(refresh_token.expose(), false) {
+            return Err(config("invalid refresh token"))
+        }
+        let fields = Vec::from_array(
+            [("grant_type", "refresh_token"), ("refresh_token", refresh_token.expose())],
+        );
+        let scope = scope_text(scopes)?;
+        if scope != "" {
+            fields.push(("scope", scope));
+        }
+        self.send(context, fields)
+    }
+
+    pub fn client_credentials(self: Client, context: context::Context, scopes: Vec[string]) -> Result[
+        Token,
+        Error,
+    ] {
+        if let ClientAuth::Public = self.authentication {
+            return Err(config("client credentials requires confidential client authentication"))
+        }
+        let fields = Vec::from_array([("grant_type", "client_credentials")]);
+        let scope = scope_text(scopes)?;
+        if scope != "" {
+            fields.push(("scope", scope));
+        }
+        self.send(context, fields)
+    }
+}
+
+fn transport_error(value: request::Error) -> Error {
+    let kind = match value.kind {
+        request::ErrorKind::Timeout => ErrorKind::Timeout,
+        request::ErrorKind::Cancelled => ErrorKind::Cancelled,
+        request::ErrorKind::BodyLimit => ErrorKind::BodyLimit,
+        request::ErrorKind::Closed => ErrorKind::Closed,
+        request::ErrorKind::Builder => ErrorKind::Configuration,
+        _ => ErrorKind::Transport,
+    };
+    error(kind, "token request failed")
+}

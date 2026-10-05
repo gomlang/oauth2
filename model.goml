@@ -1,0 +1,163 @@
+package oauth2;
+
+use std::time::{Duration};
+
+pub struct Secret {
+    value: string,
+}
+
+impl Secret {
+    pub fn new(value: string) -> Secret {
+        Secret { value }
+    }
+
+    pub fn expose(self: Secret) -> string {
+        self.value
+    }
+}
+
+impl Debug for Secret {
+    fn debug(self: Secret) -> string {
+        "Secret([REDACTED])"
+    }
+}
+
+impl ToString for Secret {
+    fn to_string(self: Secret) -> string {
+        "[REDACTED]"
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Configuration,
+    Protocol,
+    State,
+    Consumed,
+    Remote,
+    Http,
+    Transport,
+    Timeout,
+    Cancelled,
+    BodyLimit,
+    Closed,
+    Random,
+}
+
+pub struct Error {
+    pub kind: ErrorKind,
+    pub status: Option[isize],
+    pub message: string,
+    pub remote_code: Option[Secret],
+    pub remote_description: Option[Secret],
+    pub remote_uri: Option[Secret],
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.kind.debug() + ": " + self.message
+    }
+}
+
+impl Debug for Error {
+    fn debug(self: Error) -> string {
+        self.to_string()
+    }
+}
+
+fn error(kind: ErrorKind, message: string) -> Error {
+    Error {
+        kind,
+        message,
+        status: Option::None,
+        remote_code: Option::None,
+        remote_description: Option::None,
+        remote_uri: Option::None,
+    }
+}
+
+pub enum ClientAuth {
+    Public,
+    Basic(Secret),
+    Post(Secret),
+}
+
+impl Debug for ClientAuth {
+    fn debug(self: ClientAuth) -> string {
+        match self {
+            Public => "ClientAuth::Public",
+            Basic(_) => "ClientAuth::Basic([REDACTED])",
+            Post(_) => "ClientAuth::Post([REDACTED])",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransportPolicy {
+    HttpsOnly,
+    LoopbackHttp,
+}
+
+pub struct Options {
+    pub transport: TransportPolicy,
+    pub timeout: Duration,
+    pub response_bytes: isize,
+    pub request_bytes: isize,
+    pub root_certificate: string,
+    pub expected_issuer: Option[string],
+}
+
+impl Options {
+    pub fn new() -> Options {
+        Options {
+            transport: TransportPolicy::HttpsOnly,
+            timeout: Duration::from_seconds(30),
+            response_bytes: 65536,
+            request_bytes: 65536,
+            root_certificate: "",
+            expected_issuer: Option::None,
+        }
+    }
+}
+
+pub struct Token {
+    access: Secret,
+    refresh: Option[Secret],
+    kind: string,
+    expires: Option[isize],
+    scope: Option[Vec[string]],
+}
+
+impl Token {
+    pub fn access_token(self: Token) -> Secret {
+        self.access
+    }
+
+    pub fn refresh_token(self: Token) -> Option[Secret] {
+        self.refresh
+    }
+
+    pub fn token_type(self: Token) -> string {
+        self.kind
+    }
+
+    pub fn expires_in(self: Token) -> Option[isize] {
+        self.expires
+    }
+
+    pub fn scopes(self: Token) -> Option[Vec[string]] {
+        self.scope.map(|scopes| scopes.copy())
+    }
+}
+
+impl Debug for Token {
+    fn debug(self: Token) -> string {
+        "Token([REDACTED])"
+    }
+}
+
+impl ToString for Token {
+    fn to_string(self: Token) -> string {
+        "Token([REDACTED])"
+    }
+}

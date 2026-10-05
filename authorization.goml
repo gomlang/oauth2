@@ -1,0 +1,174 @@
+package oauth2;
+
+use ecosystem::request;
+use std::context;
+use std::net::url;
+
+pub struct Authorization {
+    client: Client,
+    url_value: string,
+    redirect: url::Reference,
+    redirect_text: string,
+    state_value: Secret,
+    proof: Pkce,
+    gate: Channel[()],
+    consumed: Ref[bool],
+}
+
+impl Debug for Authorization {
+    fn debug(self: Authorization) -> string {
+        "Authorization([REDACTED])"
+    }
+}
+
+impl Client {
+    pub fn authorization(
+        self: Client,
+        authorization_endpoint: string,
+        redirect_uri: string,
+        scopes: Vec[string],
+    ) -> Result[Authorization, Error] {
+        let auth = endpoint(authorization_endpoint, self.options.transport)?;
+        reserved_query(
+            auth,
+            Vec::from_array(
+                [
+                    "response_type",
+                    "client_id",
+                    "redirect_uri",
+                    "scope",
+                    "state",
+                    "code_challenge",
+                    "code_challenge_method",
+                ],
+            ),
+        )?;
+        let redirect = endpoint(redirect_uri, self.options.transport)?;
+        reserved_query(
+            redirect,
+            Vec::from_array(["state", "code", "error", "error_description", "error_uri", "iss"]),
+        )?;
+        let scope = scope_text(scopes)?;
+        let state = random_secret()?;
+        let proof = Pkce::generate()?;
+        let fields = Vec::from_array(
+            [
+                ("response_type", "code"),
+                ("client_id", self.id),
+                ("redirect_uri", redirect_uri),
+                ("state", state.expose()),
+                ("code_challenge", proof.challenge()),
+                ("code_challenge_method", "S256"),
+            ],
+        );
+        if scope != "" {
+            fields.push(("scope", scope));
+        }
+        let url = request::Url::parse(authorization_endpoint).map_err(
+            |_| config("invalid authorization URL"),
+        )?.query(fields).map_err(|_| config("authorization URL encoding failed"))?.as_string();
+        if url.byte_len() > 65536 {
+            return Err(config("authorization URL exceeds limit"))
+        }
+        let gate = Channel::new(1);
+        gate.send(());
+        Ok(
+            Authorization {
+                client: self,
+                url_value: url,
+                redirect,
+                redirect_text: redirect_uri,
+                state_value: state,
+                proof,
+                gate,
+                consumed: Ref::new(false),
+            },
+        )
+    }
+}
+
+impl Authorization {
+    pub fn url(self: Authorization) -> string {
+        self.url_value
+    }
+
+    pub fn state(self: Authorization) -> Secret {
+        self.state_value
+    }
+
+    pub fn pkce(self: Authorization) -> Pkce {
+        self.proof
+    }
+
+    fn response(self: Authorization, callback_url: string) -> Result[Secret, Error] {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        if self.consumed.get() {
+            return Err(error(ErrorKind::Consumed, "authorization response already consumed"))
+        }
+        let callback = endpoint(callback_url, self.client.options.transport).map_err(
+            |_| protocol("invalid callback URL"),
+        )?;
+        if callback.scheme() != self.redirect.scheme()
+            || callback.raw_authority() != self.redirect.raw_authority()
+            || callback.raw_path() != self.redirect.raw_path() {
+            return Err(protocol("callback does not match registered redirect URI"))
+        }
+        let fields = query(callback.raw_query().unwrap_or(""))?;
+        for (name, value) in query(self.redirect.raw_query().unwrap_or(""))? {
+            if lookup(fields, name) != Option::Some(value) {
+                return Err(protocol("callback changed registered redirect query"))
+            }
+        }
+        let state = lookup(fields, "state").ok_or(
+            error(ErrorKind::State, "authorization state missing"),
+        )?;
+        if !secret_equal(state, self.state_value.expose()) {
+            return Err(error(ErrorKind::State, "authorization state mismatch"))
+        }
+        if let Option::Some(issuer) = self.client.options.expected_issuer {
+            if lookup(fields, "iss") != Option::Some(issuer) {
+                return Err(error(ErrorKind::State, "authorization issuer mismatch"))
+            }
+        }
+        let code = lookup(fields, "code");
+        let failure = lookup(fields, "error");
+        if code.is_some() == failure.is_some() {
+            return Err(protocol("callback must contain exactly one code or error"))
+        }
+        if let Option::Some(failure) = failure {
+            let failure = remote_error(
+                failure,
+                lookup(fields, "error_description"),
+                lookup(fields, "error_uri"),
+                Option::None,
+            )?;
+            self.consumed.set(true);
+            return Err(failure)
+        }
+        let code = code.unwrap_or("");
+        if !bounded_text(code, false) {
+            return Err(protocol("invalid authorization code"))
+        }
+        self.consumed.set(true);
+        Ok(Secret::new(code))
+    }
+
+    pub fn exchange(self: Authorization, context: context::Context, callback_url: string) -> Result[
+        Token,
+        Error,
+    ] {
+        let code = self.response(callback_url)?;
+        self.client.send(
+            context,
+            Vec::from_array(
+                [
+                    ("grant_type", "authorization_code"),
+                    ("code", code.expose()),
+                    ("redirect_uri", self.redirect_text),
+                    ("code_verifier", self.proof.verifier().expose()),
+                ],
+            ),
+        )
+    }
+}

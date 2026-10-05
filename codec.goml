@@ -1,0 +1,113 @@
+package oauth2;
+
+use ecosystem::request;
+use std::net::url;
+use std::bytes;
+use std::utf8;
+
+fn config(message: string) -> Error {
+    error(ErrorKind::Configuration, message)
+}
+
+fn protocol(message: string) -> Error {
+    error(ErrorKind::Protocol, message)
+}
+
+fn bounded_text(value: string, allow_empty: bool) -> bool {
+    if value.byte_len() > 16384 || (!allow_empty && value == "") {
+        return false
+    }
+    for ch in value.to_bytes() {
+        if ch < 32 || ch == 127 {
+            return false
+        }
+    }
+    true
+}
+
+fn scope_text(scopes: Vec[string]) -> Result[string, Error] {
+    let seen: HashMap[string, bool] = HashMap::new();
+    for scope in scopes {
+        if scope == "" {
+            return Err(config("empty scope token"))
+        }
+        for ch in scope.to_bytes() {
+            if ch < 33 || ch > 126 || ch == 34 || ch == 92 {
+                return Err(config("invalid scope token"))
+            }
+        }
+        if seen.contains(scope) {
+            return Err(config("duplicate scope token"))
+        }
+        seen.insert(scope, true);
+    }
+    let result = scopes.join(" ");
+    if result.byte_len() > 16384 {
+        return Err(config("scope exceeds limit"))
+    }
+    Ok(result)
+}
+
+fn query(value: string) -> Result[Vec[(string, string)], Error] {
+    let fields = url::parse_query_bounded(value, 65536, 128, 65536).map_err(
+        |_| protocol("invalid or excessive query parameters"),
+    )?;
+    let seen: HashMap[string, bool] = HashMap::new();
+    let result = Vec::new();
+    for (name, value) in fields {
+        let name = utf8::decode(name.to_vec()).map_err(|_| protocol("query is not UTF-8"))?;
+        let value = utf8::decode(value.to_vec()).map_err(|_| protocol("query is not UTF-8"))?;
+        if seen.contains(name) {
+            return Err(protocol("duplicate query parameter"))
+        }
+        seen.insert(name, true);
+        result.push((name, value));
+    }
+    Ok(result)
+}
+
+fn lookup(values: Vec[(string, string)], name: string) -> Option[string] {
+    for pair in values {
+        if pair.0 == name {
+            return Option::Some(pair.1)
+        }
+    }
+    Option::None
+}
+
+fn endpoint(value: string, policy: TransportPolicy) -> Result[url::Reference, Error] {
+    if value.byte_len() > 16384 {
+        return Err(config("endpoint exceeds limit"))
+    }
+    let reference = url::Reference::parse(value, 16384).map_err(|_| config("invalid endpoint URL"))?;
+    if reference.raw_fragment().is_some() {
+        return Err(config("endpoint must not contain a fragment"))
+    }
+    let parsed = request::Url::parse(value).map_err(|_| config("invalid endpoint URL"))?;
+    if !parsed.is_https() {
+        let authority = reference.authority().map_err(|_| config("invalid endpoint authority"))?.ok_or(
+            config("missing endpoint authority"),
+        )?;
+        let host = authority.raw_host();
+        if policy != TransportPolicy::LoopbackHttp || (host != "127.0.0.1" && host != "[::1]") {
+            return Err(
+                config("HTTPS required; HTTP is restricted to explicit numeric loopback policy"),
+            )
+        }
+    }
+    let _ = query(reference.raw_query().unwrap_or("")).map_err(|_| config("invalid endpoint query"))?;
+    Ok(reference)
+}
+
+fn reserved_query(reference: url::Reference, names: Vec[string]) -> Result[(), Error] {
+    for (name, _) in query(reference.raw_query().unwrap_or(""))? {
+        if names.contains(name) {
+            return Err(config("endpoint query conflicts with protocol parameter"))
+        }
+    }
+    Ok(())
+}
+
+fn form_component(value: string) -> Result[string, Error] {
+    url::query_escape(value, 65536).map_err(|_| config("client credential encoding exceeds limit"))
+}

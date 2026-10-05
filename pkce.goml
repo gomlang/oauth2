@@ -1,0 +1,78 @@
+package oauth2;
+
+use std::bytes;
+use std::crypto;
+use std::crypto::rand;
+use std::crypto::hash::{Sha256Digest};
+use std::hash::{Hasher};
+use std::encoding::base64;
+
+pub struct Pkce {
+    value: Secret,
+}
+
+impl Pkce {
+    pub fn generate() -> Result[Pkce, Error] {
+        Pkce::from_verifier(random_secret()?)
+    }
+
+    pub fn from_verifier(value: Secret) -> Result[Pkce, Error] {
+        let text = value.expose();
+        if text.byte_len() < 43 || text.byte_len() > 128 {
+            return Err(
+                error(
+                    ErrorKind::Configuration,
+                    "PKCE verifier must contain 43 to 128 unreserved ASCII characters",
+                ),
+            )
+        }
+        for ch in text.to_bytes() {
+            if !((ch >= b'a' && ch <= b'z') || (ch >= b'A' && ch <= b'Z')
+                || (ch >= b'0' && ch <= b'9')
+                || ch == b'-'
+                || ch == b'.'
+                || ch == b'_'
+                || ch == b'~') {
+                return Err(error(ErrorKind::Configuration, "invalid PKCE verifier character"))
+            }
+        }
+        Ok(Pkce { value })
+    }
+
+    pub fn verifier(self: Pkce) -> Secret {
+        self.value
+    }
+
+    pub fn challenge(self: Pkce) -> string {
+        let digest = Sha256Digest::new256();
+        digest.update(bytes::Bytes::from_string(self.value.expose()).as_slice());
+        base64::encode_with(digest.sum(), base64::Variant::UrlSafeNoPadding)
+    }
+
+    pub fn matches(self: Pkce, challenge: string) -> bool {
+        secret_equal(self.challenge(), challenge)
+    }
+}
+
+impl Debug for Pkce {
+    fn debug(self: Pkce) -> string {
+        "Pkce(S256, [REDACTED])"
+    }
+}
+
+fn random_secret() -> Result[Secret, Error] {
+    Ok(
+        Secret::new(
+            base64::encode_with(
+                rand::bytes(32).map_err(
+                    |_| error(ErrorKind::Random, "secure random generation failed"),
+                )?,
+                base64::Variant::UrlSafeNoPadding,
+            ),
+        ),
+    )
+}
+
+fn secret_equal(left: string, right: string) -> bool {
+    crypto::digest_equal(left.to_bytes().as_slice(), right.to_bytes().as_slice())
+}
