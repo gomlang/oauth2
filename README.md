@@ -13,8 +13,10 @@ by OAuth. Post credentials appear in the request body.
 
 ```toml
 [dependencies]
-"ecosystem::oauth2" = "0.1.0"
+"ecosystem::oauth2" = true
 ```
+
+GoML dependencies are unversioned: `true` tracks each package repository’s default branch.
 
 ## Authorization code
 
@@ -144,7 +146,7 @@ only a fixed message and redacted PKCE metadata. `goml test` uses a real local
 HTTP/TLS service in `testserver/`; its Go implementation independently parses
 form/Basic requests and computes PKCE hashes. Tests cover concurrent flow
 consumption, TLS trust, redirects, malformed/error responses, body limits,
-cancellation and deadlines. `goml verify` checks the isolated pure-GoML example
+cancellation and deadlines. The ecosystem verification runner checks the isolated pure-GoML example
 consumer. Native oracle checks: `go test ./testserver` and
 `go test -race ./testserver`; the GoML tests can also run with `GOFLAGS=-race`.
 

@@ -2,4 +2,4 @@
 path = "ecosystem::oauth2"
 
 [dependencies]
-"ecosystem::request" = "0.1.0"
+"ecosystem::request" = true
